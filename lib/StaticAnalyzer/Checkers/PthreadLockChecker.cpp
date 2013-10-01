@@ -9,6 +9,7 @@
 //
 // This defines PthreadLockChecker, a simple lock -> unlock checker.
 // Also handles XNU locks, which behave similarly enough to share code.
+// And Linux kernel locks too.
 //
 //===----------------------------------------------------------------------===//
 
@@ -19,6 +20,7 @@
 #include "clang/StaticAnalyzer/Core/PathSensitive/CheckerContext.h"
 #include "clang/StaticAnalyzer/Core/PathSensitive/ProgramStateTrait.h"
 #include "llvm/ADT/ImmutableList.h"
+#include "llvm/Support/Regex.h"
 
 using namespace clang;
 using namespace ento;
@@ -30,7 +32,8 @@ class PthreadLockChecker : public Checker< check::PostStmt<CallExpr> > {
   enum LockingSemantics {
     NotApplicable = 0,
     PthreadSemantics,
-    XNUSemantics
+    XNUSemantics,
+    LinuxSemantics
   };
 public:
   void checkPostStmt(const CallExpr *CE, CheckerContext &C) const;
@@ -40,11 +43,20 @@ public:
     
   void ReleaseLock(CheckerContext &C, const CallExpr *CE, SVal lock) const;
 };
+
+// should be inside the class, but the class is const and Regex.match()
+// modifies the "error" member
+llvm::Regex LinuxLock("^(_?raw_|bit_|rcu_)?(spin|read|write|mutex)_(try|nest_|seq)?lock(_(bh|irq|irqsave))?(_nested)?$");
+llvm::Regex LinuxUnlock("^(raw_|bit_|rcu_)?(spin|read|write|mutex)_(seq)?unlock(_bh|_irq|_irqrestore)?$");
+// Checked only after LinuxLock
+// XXX how about semaphores with non lock semantics?
+llvm::Regex LinuxLock_sem("^down(_(read|write))?$");
+llvm::Regex LinuxUnlock_sem("^up(_(read|write))?$");
+llvm::Regex TryLock("try_.*");
 } // end anonymous namespace
 
 // GDM Entry for tracking lock state.
 REGISTER_LIST_WITH_PROGRAMSTATE(LockSet, const MemRegion *)
-
 
 void PthreadLockChecker::checkPostStmt(const CallExpr *CE,
                                        CheckerContext &C) const {
@@ -54,7 +66,7 @@ void PthreadLockChecker::checkPostStmt(const CallExpr *CE,
   if (FName.empty())
     return;
 
-  if (CE->getNumArgs() != 1)
+  if (CE->getNumArgs() != 1 && CE->getNumArgs() != 2)
     return;
 
   if (FName == "pthread_mutex_lock" ||
@@ -81,6 +93,11 @@ void PthreadLockChecker::checkPostStmt(const CallExpr *CE,
            FName == "pthread_rwlock_unlock" ||
            FName == "lck_mtx_unlock" ||
            FName == "lck_rw_done")
+    ReleaseLock(C, CE, state->getSVal(CE->getArg(0), LCtx));
+  else if (LinuxLock.match(FName) || LinuxLock_sem.match(FName))
+    AcquireLock(C, CE, state->getSVal(CE->getArg(0), LCtx),
+		TryLock.match(FName), LinuxSemantics);
+  else if (LinuxUnlock.match(FName) || LinuxUnlock_sem.match(FName))
     ReleaseLock(C, CE, state->getSVal(CE->getArg(0), LCtx));
 }
 
@@ -122,6 +139,9 @@ void PthreadLockChecker::AcquireLock(CheckerContext &C, const CallExpr *CE,
     case PthreadSemantics:
       llvm::tie(lockFail, lockSucc) = state->assume(retVal);    
       break;
+    case LinuxSemantics:
+      llvm::tie(lockSucc, lockFail) = state->assume(retVal);    
+      break;
     case XNUSemantics:
       llvm::tie(lockSucc, lockFail) = state->assume(retVal);    
       break;
@@ -137,8 +157,8 @@ void PthreadLockChecker::AcquireLock(CheckerContext &C, const CallExpr *CE,
     assert(lockSucc);
 
   } else {
-    // XNU locking semantics return void on non-try locks
-    assert((semantics == XNUSemantics) && "Unknown locking semantics");
+    // XNU or Linux locking semantics return void on non-try locks
+    assert((semantics == XNUSemantics || semantics == LinuxSemantics) && "Unknown locking semantics");
     lockSucc = state;
   }
   
